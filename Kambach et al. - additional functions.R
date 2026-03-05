@@ -11,10 +11,24 @@ unify.EUNIS.levels = function(eunis.temp){
   return("~")
 }
 
+# custom scaling function -------------------------------------------------
+scale_this <- function(x){
+  (x - mean(x, na.rm=TRUE)) / sd(x, na.rm=TRUE)
+}
+
+# calculate combined cover across multiple layers -------------------------
+combine.cover <- function(x){
+  # x= COV_PERC
+  while (length(x)>1){
+    x[2] <- x[1]+(100-x[1])*x[2]/100
+    x <- x[-1]
+  }
+  return(x)
+}
+
 # calculate species richness -------
 calculate.species.richness = function(taxon.temp){
   return(length(unique(taxon.temp)))}
-
 
 # calculate Shannon diversity ---------
 calculate.shannon.diversity = function(taxon.temp, cover.temp){
@@ -35,13 +49,6 @@ calculate.functional.diversity = function(taxon.temp, cover.temp){
   # order dat.temp by taxon name
   dat.temp = data.table(taxon = taxon.temp,
                         cover_perc = cover.temp)[order(taxon)]
-  
-  # sum up cover values from different layers
-  dat.temp = dat.temp[,.(cover_perc = sum(cover_perc, na.rm = T)), by = taxon]
-  
-  # for presence absence data, replace zero cover values with a value of 1
-  if(sum(dat.temp$cover_perc, na.rm = T) == 0){
-    dat.temp$cover_perc = 1}
   
   # join trait data
   traits.temp = dat.try.scaled[dat.temp, on = .(Taxon_name = taxon), nomatch = 0]
@@ -560,45 +567,3 @@ get.decadal.changes.in.species.richness.with.hand.assigned.trajectories =
     return(results.temp)
   }
 
-
-################################################################################
-analyse.and.compile.lms = function(dat.temp, metric.temp){
-  
-  # must again order by recording_year
-  dat.temp = dat.temp[order(dat.temp$year_of_recording),]
-  
-  # run linear model
-  lm.temp = lm(div_value ~ year_of_recording, data = dat.temp)
-  
-  # compile results
-  return(c("metric" = metric.temp,
-           "time_seriesID" = dat.temp$time_seriesID[1],
-           "intercept" = as.character(lm.temp$coefficients[1]),
-           "slope" = as.character(lm.temp$coefficients[2]),
-           "initial_div_value" = dat.temp$div_value[1],
-           "EUNIS_start" = dat.temp$Expert_system[1],
-           "EUNIS_end" = dat.temp$Expert_system[nrow(dat.temp)],
-           "year_start" = dat.temp$year_of_recording[1],
-           "year_end" = dat.temp$year_of_recording[nrow(dat.temp)],
-           "n" = nrow(dat.temp)))}
-
-################################################################################
-analyse.and.compile.lms.of.rate.change = function(dat.temp, metric.temp){
-  
-  # must again sort by year_of_recording
-  dat.temp = dat.temp[order(dat.temp$year_of_recording),]
-  
-  # run linear model
-  lm.temp = lm(log(div_value) ~ year_of_recording, data = dat.temp)
-  
-  # compile results
-  return(c("metric" = metric.temp,
-           "time_seriesID" = dat.temp$time_seriesID[1],
-           "intercept" = as.character(exp(lm.temp$coefficients[1]) - 1),
-           "slope" = as.character(exp(lm.temp$coefficients[2]) - 1),
-           "initial_div_value" = dat.temp$div_value[1],
-           "EUNIS_start" = dat.temp$Expert_system[1],
-           "EUNIS_end" = dat.temp$Expert_system[nrow(dat.temp)],
-           "year_start" = dat.temp$year_of_recording[1],
-           "year_end" = dat.temp$year_of_recording[nrow(dat.temp)],
-           "n" = nrow(dat.temp)))}
