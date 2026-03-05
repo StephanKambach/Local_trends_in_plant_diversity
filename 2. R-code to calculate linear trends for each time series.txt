@@ -1,0 +1,351 @@
+###################################################################
+# Calculate linear trends in biodiversity indices in ReSurvey Europe
+# Script by: Stephan Kambach using code from Helge Bruelheide
+# stephan.kambach@gmail.com, helge.bruelheide@botanik.uni-halle.de
+# initial date: 18.06.2024
+###################################################################
+
+# clear workspace
+rm(list=ls())
+gc()
+
+# load libraries
+library(tidyverse)
+library(tidymodels)
+library(broom.mixed)
+library(data.table)
+library(lubridate)
+library(lme4)
+library(metan)
+library(weights)
+library(modEvA)
+library(readxl)
+library(xlsx)
+
+# set working directory
+setwd()
+
+# load additional functions
+source("additional functions.R")
+
+# 1. load and prepare data -----------------------------------------------------
+# load header data
+dat.header.resurvey = fread("200_MOTIVATE20240412_header_Resurvey.csv", sep = "\t") %>% 
+  mutate(`Date of recording` = as.Date(`Date of recording`, tryFormats = c("%d.%m.%Y"))) %>% 
+  unite("time_seriesID", c(`ReSurvey project`, `ReSurvey site`, `ReSurvey plot`), sep = " - ", remove = F) %>%  
+  # correct country name
+  mutate(Country = ifelse(Country == "DE", "Germany", Country)) %>% 
+  # correct wrong coordinate format
+  mutate(corrected_lon_lat = ifelse((Longitude > 200 | Longitude < -200) & (Latitude > 200 | Latitude < -200), T, F)) %>%
+  mutate(Latitude = ifelse(corrected_lon_lat == T, Latitude / 10000, Latitude),
+         Longitude = ifelse(corrected_lon_lat == T, Longitude / 10000, Longitude)) %>% 
+  # unify when there are multiple EUNIS classes possible
+  mutate(`Expert system` = ifelse(`Expert system` %in% c("", "~"), "~", `Expert system`)) %>% 
+  rowwise() %>% 
+  mutate(`Expert system` = unify.EUNIS.levels(`Expert system`)) %>% 
+  # truncated EUNIS classes Qa + Qb -> Q | Sa + Sb -> S
+  mutate(`Expert system` = ifelse(`Expert system` %in% c("Qa", "Qb"), "Q", `Expert system`),
+         `Expert system` = ifelse(`Expert system` %in% c("Sa", "Sb"), "S", `Expert system`)) %>% 
+  data.table()
+  
+# load diversity indices for each vegetation observation
+resurvey.diversity = fread("plot_level_diversity_CWMs_CWVs.csv", 
+                           sep = "\t") %>% 
+  # rename plot size
+  rename(plot_size = `Relevé area (m²)`) %>% 
+  # sort from earliest to latest sampling dates
+  arrange(`Date of recording`, time_seriesID) %>% 
+  # convert Date format
+  mutate(`Date of recording` = as.Date(`Date of recording`, tryFormats = c("%d.%m.%Y"))) %>% 
+  mutate(year_of_recording = year(`Date of recording`)) %>% 
+  # replace MA in EUNIS classification with M
+  mutate(`Expert system` = gsub("MA", "M", `Expert system`))  %>% 
+  # truncated EUNIS classes Qa + Qb -> Q | Sa + Sb -> S
+  mutate(`Expert system` = ifelse(`Expert system` %in% c("Qa", "Qb"), "Q", `Expert system`),
+         `Expert system` = ifelse(`Expert system` %in% c("Sa", "Sb"), "S", `Expert system`)) %>% 
+  # determine common EUNIS levels for plots that were classified in multiple habitats
+  rowwise() %>% 
+  mutate(`Expert system` = ifelse(`Expert system` %in% c("", "~"), "~", `Expert system`)) %>% 
+  mutate(`Expert system` = unify.EUNIS.levels(`Expert system`)) %>%
+  ungroup() # 1 min
+
+# replace white spaces and minus signs in column names
+names(resurvey.diversity) = gsub(" ", "_", names(resurvey.diversity))  
+names(resurvey.diversity) = gsub("-", "_", names(resurvey.diversity))  
+
+# load hand-assigned EUNIS trajectories
+EUNIS.trajectories = read_excel("all_EUNIS_combinations_hand_assigned.xlsx", 
+                                sheet = 1) %>% 
+  dplyr::select(Trajectory, Expert_System1, Expert_System2) %>% 
+  # replace MA in EUNIS classification with M
+  mutate(Expert_System1  = gsub("MA", "M", Expert_System1),
+         Expert_System2  = gsub("MA", "M", Expert_System2))
+
+# as only trajectories from lower to higher alphabetical classes are assigned by hand
+# the other half (from higher to lower alphabetical order) must be added while
+# switching succession and disturbance (i.e.) 1->2 = succession must be 2->1 = disturbance
+EUNIS.trajectories = EUNIS.trajectories %>% 
+  bind_rows(EUNIS.trajectories %>% 
+              dplyr::select(Trajectory = 1, "Expert_System1" = 3, "Expert_System2" = 2) %>% 
+              mutate(Trajectory = recode(Trajectory, 
+                                         "succession" = "disturbance", 
+                                         "disturbance" = "succession")))
+
+# all metrics to analyse
+all.metrics = c("cover_sum", "species_richness", "shannon_diversity", 
+                "FRic", "FEve", "FDiv", "PD", "MPD", "MNTD",
+                 "threatened_nr", "threatened_cover_percent", 
+                "non_native_nr", "non_native_cover_percent", 
+                "specialist_nr", "generalist_nr", "cover_specialist", "cover_generalist", 
+                "CWM_niche_width")
+
+all.rate.metrics = c("cover_sum", "species_richness", "shannon_diversity", 
+                     "FRic", "FEve", "FDiv", "PD", "MPD", "MNTD",
+                     "threatened_nr", "threatened_cover_percent", 
+                     "non_native_nr", "non_native_cover_percent", 
+                     "specialist_nr", "generalist_nr", "cover_specialist", "cover_generalist", 
+                     "CWM_niche_width")
+
+# rename EUNIS classes
+EUNIS1.rename = c("~" = "- unassigned", 
+                  "M" = "MA - Marine habitats", 
+                  "N" = "N - Coastal habitats",
+                  "P" = "P - Inland waters",
+                  "Q" = "Q - Mires and wetlands",
+                  "R" = "R - Grasslands", 
+                  "S" = "S - Shrublands and heathlands", 
+                  "T" = "T - Forests", 
+                  "U" = "U - Inland sparse vegetation", 
+                  "V" = "V - Vegetated man-made habitats")
+
+EUNIS1.colors = c("all" = "black", 
+                  "- unassigned" = "#D3D3D3",
+                  "MA - Marine habitats" = "#bf93d2",
+                  "N - Coastal habitats" = "#9ecae1",
+                  "P - Inland waters" = "#6083d0",
+                  "Q - Mires and wetlands" = "#addd8e",
+                  "R - Grasslands" = "#ffffd4",
+                  "S - Shrublands and heathlands" = "#fe9929",
+                  "T - Forests" = "#31a354",
+                  "U - Inland sparse vegetation" = "#eaa9a5",
+                  "V - Vegetated man-made habitats" = "#b7251b")
+
+# 2a. linear analyses of absolute changes - full data --------------------------
+
+a = Sys.time()
+for(metric.temp in all.metrics){
+
+  # separately for each time_seriesID
+  results.temp = resurvey.diversity %>% 
+    dplyr::select(time_seriesID, div_value = all_of(metric.temp), Expert_system, year_of_recording) %>% 
+    filter(!is.infinite(div_value)) %>% 
+    drop_na() %>% 
+    group_split(time_seriesID) %>% 
+    lapply(FUN = analyse.and.compile.lms, metric.temp) %>% 
+    bind_rows()
+  
+  write_delim(results.temp, 
+              paste0("lm_", metric.temp, ".csv"),
+              delim = "\t")
+  print(paste0("done: ", metric.temp, " - ",  round(difftime(Sys.time(), a, units='mins'), 2), " min"))
+} # 1 min per metric
+
+rm("results.temp"); gc()
+
+# 2d. linear analyses of annual % changes - full data --------------------------
+# relative change is calculated by using log(x) ~ year_of_recording
+# followed by a back-transformation of the coefficient estimate later on
+# = exp(coef) -1 gives the annual percentage change
+
+a = Sys.time()
+for(metric.temp in all.rate.metrics){
+  
+  # separate by time series id
+  results.temp = resurvey.diversity %>% 
+    dplyr::select(time_seriesID, div_value = all_of(metric.temp), Expert_system, year_of_recording, Date_of_recording) %>% 
+    filter(!is.infinite(div_value))
+  
+  # cover and species no. must be added a constant of 0.5 since these can be zero
+  # which is half of the minimum value (0.001 would lead to wrong coefficient estimates)
+  if(metric.temp %in% c("threatened_nr", "threatened_cover_percent", 
+                        "non_native_nr", "non_native_cover_percent", 
+                        "specialist_nr", "generalist_nr", 
+                        "cover_specialist", "cover_generalist")){
+      results.temp$div_value = results.temp$div_value + 0.5}
+  
+  results.temp = results.temp %>% 
+    drop_na() %>% 
+    group_split(time_seriesID) %>% 
+    lapply(FUN = analyse.and.compile.lms.of.rate.change, metric.temp) %>% 
+    bind_rows()
+  
+  write_delim(results.temp, 
+              paste0("lm_", metric.temp, ".csv"),
+              delim = "\t")
+  print(paste0("done: ", metric.temp, " - ",  round(difftime(Sys.time(), a, units='mins'), 2), " min"))
+}
+
+rm("results.temp"); gc()
+
+# 3. load all lm results -------------------------------------------------------
+all.lm.tidy.fits = list()
+
+all.rate.lm.tidy.fits = list()
+
+for(i in 1:length(all.metrics)){
+  metric.temp = all.metrics[i]
+  
+  all.lm.tidy.fits[[metric.temp]] = read_delim(paste0("lm_",metric.temp, ".csv"),
+                                               delim = "\t")
+                                               delim = "\t")
+  
+  all.rate.lm.tidy.fits[[metric.temp]] = read_delim(paste0("lm_",metric.temp, ".csv"),
+                                                    delim = "\t")
+}
+
+# extract slopes ----------------------------------------------------------
+
+all.lm.tidy.fits = all.lm.tidy.fits %>% 
+  bind_rows() %>% 
+  filter(n > 1) %>% 
+  mutate(weight_value = log(n),
+         timespan = year_end - year_start) %>%
+  # remove time series with only one year
+  filter(year_end != year_start) %>% 
+  # correct auxiliary EUNIS classes Qa + Qb -> Q | Sa + Sb -> S
+  mutate(EUNIS_start = ifelse(EUNIS_start %in% c("Qa", "Qb"), "Q", EUNIS_start),
+         EUNIS_start = ifelse(EUNIS_start %in% c("Sa", "Sb"), "S", EUNIS_start),
+         EUNIS_end = ifelse(EUNIS_end %in% c("Qa", "Qb"), "Q", EUNIS_end),
+         EUNIS_end = ifelse(EUNIS_end %in% c("Sa", "Sb"), "S", EUNIS_end)) %>% 
+  # correct wrong EUNIS P classes that should be level 3
+  mutate(EUNIS_start = recode(EUNIS_start, 
+                              "Pa" = "P3a", "Pb" = "P3b", "Pc" = "P3c",
+                              "Pd" = "P3d", "Pe" = "P3e", "Pf" = "P3f",
+                              "Pg" = "P3g", "Ph" = "P3h", "Pi" = "P3i")) %>% 
+  mutate(EUNIS_end = recode(EUNIS_end, 
+                            "Pa" = "P3a", "Pb" = "P3b", "Pc" = "P3c",
+                            "Pd" = "P3d", "Pe" = "P3e", "Pf" = "P3f",
+                            "Pg" = "P3g", "Ph" = "P3h", "Pi" = "P3i")) %>% 
+  # separate levels of EUNIS classification
+  mutate(EUNIS1_start = substr(EUNIS_start, start = 1, stop = 1),
+         EUNIS2_start = substr(EUNIS_start, start = 1, stop = 2),
+         EUNIS3_start = substr(EUNIS_start, start = 1, stop = 3)) %>% 
+  mutate(EUNIS1_end = substr(EUNIS_end, start = 1, stop = 1),
+         EUNIS2_end = substr(EUNIS_end, start = 1, stop = 2),
+         EUNIS3_end = substr(EUNIS_end, start = 1, stop = 3)) %>% 
+  # remove classifications that are not on the according level
+  mutate(EUNIS2_start = ifelse(nchar(EUNIS2_start) < 2, NA, EUNIS2_start),
+         EUNIS3_start = ifelse(nchar(EUNIS3_start) < 3, NA, EUNIS3_start)) %>% 
+  mutate(EUNIS2_end = ifelse(nchar(EUNIS2_end) < 2, NA, EUNIS2_end),
+         EUNIS3_end = ifelse(nchar(EUNIS3_end) < 3, NA, EUNIS3_end))
+
+all.rate.lm.tidy.fits = all.rate.lm.tidy.fits %>% 
+  bind_rows() %>% 
+  filter(n > 1) %>% 
+  mutate(weight_value = log(n),
+         timespan = year_end - year_start) %>%
+  # remove time series with only one year
+  filter(year_end != year_start) %>% 
+  # correct auxiliary EUNIS classes Qa + Qb -> Q | Sa + Sb -> S
+  mutate(EUNIS_start = ifelse(EUNIS_start %in% c("Qa", "Qb"), "Q", EUNIS_start),
+         EUNIS_start = ifelse(EUNIS_start %in% c("Sa", "Sb"), "S", EUNIS_start),
+         EUNIS_end = ifelse(EUNIS_end %in% c("Qa", "Qb"), "Q", EUNIS_end),
+         EUNIS_end = ifelse(EUNIS_end %in% c("Sa", "Sb"), "S", EUNIS_end)) %>% 
+  # correct wrong EUNIS P classes that should be level 3
+  mutate(EUNIS_start = recode(EUNIS_start, 
+                              "Pa" = "P3a", "Pb" = "P3b", "Pc" = "P3c",
+                              "Pd" = "P3d", "Pe" = "P3e", "Pf" = "P3f",
+                              "Pg" = "P3g", "Ph" = "P3h", "Pi" = "P3i")) %>% 
+  mutate(EUNIS_end = recode(EUNIS_end, 
+                            "Pa" = "P3a", "Pb" = "P3b", "Pc" = "P3c",
+                            "Pd" = "P3d", "Pe" = "P3e", "Pf" = "P3f",
+                            "Pg" = "P3g", "Ph" = "P3h", "Pi" = "P3i")) %>% 
+  # separate levels of EUNIS classification
+  mutate(EUNIS1_start = substr(EUNIS_start, start = 1, stop = 1),
+         EUNIS2_start = substr(EUNIS_start, start = 1, stop = 2),
+         EUNIS3_start = substr(EUNIS_start, start = 1, stop = 3)) %>% 
+  mutate(EUNIS1_end = substr(EUNIS_end, start = 1, stop = 1),
+         EUNIS2_end = substr(EUNIS_end, start = 1, stop = 2),
+         EUNIS3_end = substr(EUNIS_end, start = 1, stop = 3)) %>% 
+  # remove classifications that are not on the according level
+  mutate(EUNIS2_start = ifelse(nchar(EUNIS2_start) < 2, NA, EUNIS2_start),
+         EUNIS3_start = ifelse(nchar(EUNIS3_start) < 3, NA, EUNIS3_start)) %>% 
+  mutate(EUNIS2_end = ifelse(nchar(EUNIS2_end) < 2, NA, EUNIS2_end),
+         EUNIS3_end = ifelse(nchar(EUNIS3_end) < 3, NA, EUNIS3_end))
+
+# free space
+gc()
+
+# rename EUNIS level 1 habitats ------------------------------------------------
+for(i in 1:length(EUNIS1.rename)){
+  all.lm.tidy.fits$EUNIS1_end[all.lm.tidy.fits$EUNIS1_end == names(EUNIS1.rename)[i]] = EUNIS1.rename[i]
+  all.lm.tidy.fits$EUNIS1_start[all.lm.tidy.fits$EUNIS1_start == names(EUNIS1.rename)[i]] = EUNIS1.rename[i]
+  
+  all.rate.lm.tidy.fits$EUNIS1_end[all.rate.lm.tidy.fits$EUNIS1_end == names(EUNIS1.rename)[i]] = EUNIS1.rename[i]
+  all.rate.lm.tidy.fits$EUNIS1_start[all.rate.lm.tidy.fits$EUNIS1_start == names(EUNIS1.rename)[i]] = EUNIS1.rename[i]
+}
+
+# rename unclassified EUNIS level 2 and level 3 habitats -----------------------
+all.lm.tidy.fits = all.lm.tidy.fits %>% 
+  mutate(EUNIS2_start = ifelse(is.na(EUNIS2_start) | EUNIS2_start %in% c("", "~"), 
+                               "- unassigned", EUNIS2_start),
+         EUNIS2_end = ifelse(is.na(EUNIS2_end) | EUNIS2_end %in% c("", "~"), 
+                               "- unassigned", EUNIS2_end),
+         EUNIS3_start = ifelse(is.na(EUNIS3_start) | EUNIS3_start %in% c("", "~"), 
+                               "- unassigned", EUNIS3_start),
+         EUNIS3_end = ifelse(is.na(EUNIS3_end) | EUNIS3_end %in% c("", "~"), 
+                               "- unassigned", EUNIS3_end))  %>% 
+  # match with hand-assigned trajectories
+  left_join(EUNIS.trajectories,
+            by = join_by("EUNIS_start" == "Expert_System1", "EUNIS_end" == "Expert_System2")) %>% 
+  # when EUNIS3 is the same at start and end -> "stable"
+  mutate(Trajectory = ifelse(is.na(Trajectory) & EUNIS3_start != "- unassigned" & EUNIS3_start == EUNIS3_end, "stable", Trajectory)) %>% 
+  # when there is an "~" in EUNIS level 1 start AND end -> "unassigned"
+  mutate(Trajectory = ifelse(is.na(Trajectory) & EUNIS_start == "~" & EUNIS_end == "~", "unassigned", Trajectory)) %>% 
+  # when there is an "~" in either EUNIS level 1 start OR end -> "other"
+  mutate(Trajectory = ifelse(is.na(Trajectory) & (EUNIS_start == "~" | EUNIS_end == "~"), "other", Trajectory)) %>% 
+  # when only EUNIS level 2 for start and end available -> "unassigned
+  mutate(Trajectory = ifelse(is.na(Trajectory) & (EUNIS2_start == EUNIS2_end), "unassigned", Trajectory)) %>% 
+  # when only EUNIS level 1 for start and end available -> "unassigned"
+  mutate(Trajectory = ifelse(is.na(Trajectory) & (EUNIS1_start == EUNIS1_end), "unassigned", Trajectory)) %>% 
+  left_join(dat.header.resurvey %>% 
+              group_by(time_seriesID) %>% 
+              reframe(Longitude = mean(Longitude, na.rm = T),
+                      Latitude = mean(Latitude, na.rm = T), 
+                      plot_size = mean(`Relevé area (m²)`, na.rm = T )),
+            by = "time_seriesID")
+
+all.rate.lm.tidy.fits = all.rate.lm.tidy.fits %>% 
+  mutate(EUNIS2_start = ifelse(is.na(EUNIS2_start) | EUNIS2_start %in% c("", "~"), 
+                               "- unassigned", EUNIS2_start),
+         EUNIS2_end = ifelse(is.na(EUNIS2_end) | EUNIS2_end %in% c("", "~"), 
+                             "- unassigned", EUNIS2_end),
+         EUNIS3_start = ifelse(is.na(EUNIS3_start) | EUNIS3_start %in% c("", "~"), 
+                               "- unassigned", EUNIS3_start),
+         EUNIS3_end = ifelse(is.na(EUNIS3_end) | EUNIS3_end %in% c("", "~"), 
+                             "- unassigned", EUNIS3_end)) %>% 
+  # match with hand-assigned trajectories
+  left_join(EUNIS.trajectories,
+            by = join_by("EUNIS_start" == "Expert_System1", "EUNIS_end" == "Expert_System2")) %>% 
+  # when EUNIS3 is the same at start and end -> "stable"
+  mutate(Trajectory = ifelse(is.na(Trajectory) & EUNIS3_start != "- unassigned" & EUNIS3_start == EUNIS3_end, "stable", Trajectory)) %>% 
+  # when there is an "~" in EUNIS level 1 start AND end -> "unassigned"
+  mutate(Trajectory = ifelse(is.na(Trajectory) & EUNIS_start == "~" & EUNIS_end == "~", "unassigned", Trajectory)) %>% 
+  # when there is an "~" in either EUNIS level 1 start OR end -> "other"
+  mutate(Trajectory = ifelse(is.na(Trajectory) & (EUNIS_start == "~" | EUNIS_end == "~"), "other", Trajectory)) %>% 
+  # when only EUNIS level 2 for start and end available -> "unassigned
+  mutate(Trajectory = ifelse(is.na(Trajectory) & (EUNIS2_start == EUNIS2_end), "unassigned", Trajectory)) %>% 
+  # when only EUNIS level 1 for start and end available -> "unassigned"
+  mutate(Trajectory = ifelse(is.na(Trajectory) & (EUNIS1_start == EUNIS1_end), "unassigned", Trajectory)) %>% 
+  left_join(dat.header.resurvey %>% 
+              group_by(time_seriesID) %>% 
+              reframe(Longitude = mean(Longitude, na.rm = T),
+                      Latitude = mean(Latitude, na.rm = T), 
+                      plot_size = mean(`Relevé area (m²)`, na.rm = T )),
+            by = "time_seriesID")
+
+# save -------------------------------------------------------------------------
+saveRDS(all.lm.tidy.fits, 
+        "all_lm_tidy_fits.RDS")
+saveRDS(all.rate.lm.tidy.fits, 
+        "all_rate_lm_tidy_fits.RDS")

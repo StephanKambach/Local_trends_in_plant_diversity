@@ -1,0 +1,362 @@
+# clear workspace
+rm(list=ls())
+gc()
+
+# load libraries
+library(tidyverse)
+library(data.table)
+library(readxl)
+library(future.apply)
+library(FD)
+library(usedist)
+library(DescTools)
+library(codyn)
+library(FactoMineR)
+library(corrplot)
+library(ggcorrplot)
+library(xlsx)
+library(gridExtra)
+library(picante)
+library(broom)
+
+# set working directory
+setwd()
+
+# load additional functions
+source("additional functions.R")
+
+# 1. load and prepare data -----------------------------------------------------
+# load header data
+dat.header.resurvey = fread("200_Motivate20250415_header_Resurvey.csv", sep = "\t") %>% 
+  # omit a few columns for memory reasons
+  dplyr::select(- `Nr. table in publ.`, - `Nr. relevé in table`, - `Author`, - `Plot shape`, - `Location method`,
+                - `Aspect (°)`, -`Altitude`, - `Altitude (m)`, - `Name association`, - `Name alliance`) %>% 
+  # get the year of the recorded plot
+  mutate(`Year of recording` = year(as.Date(`Date of recording`, tryFormats = c("%d.%m.%Y")))) %>% 
+  # unify the EUNIS classification when multiple habitats are assigned to the lowest consistent level
+  # -> in case of multiple classes assigned, get the lowest level where they are consistent  
+  mutate(`Expert system` = ifelse(`Expert system` %in% c("", "~"), "~", `Expert system`)) %>% 
+  rowwise() %>% 
+  mutate(`Expert system` = unify.EUNIS.levels(`Expert system`)) %>% 
+  # truncated EUNIS classes Qa + Qb -> Q | Sa + Sb -> S
+  mutate(`Expert system` = ifelse(`Expert system` %in% c("Qa", "Qb"), "Q", `Expert system`),
+         `Expert system` = ifelse(`Expert system` %in% c("Sa", "Sb"), "S", `Expert system`)) %>% 
+  data.table() # 1 min
+
+# load species data
+dat.resurvey = fread("MOTIVATE_Resurvey_clean.csv", sep = "\t")  
+  
+# join resurvey with header data, use data.table for speed
+dat.resurvey = dat.header.resurvey[dat.resurvey, on = "PlotObservationID"]
+dat.resurvey = dat.resurvey %>% 
+  dplyr::select( - `Cover tree layer (%)`, `Cover shrub layer (%)`, -`Cover herb layer (%)`, `Cover moss layer (%)`,
+                 - X, - Y, - X1, - X2, - X3, - X4, -Y1, - Y2, - Y3, - Y4) %>% 
+  data.table()
+
+# load gap-filled trait data
+load("traits_sPlot4.RData") # gap-filled traits
+
+# select and log-transform gap-filled traits for PCA analysis
+dat.try = gap_combined %>% 
+  filter(Taxon_name %in% unique(dat.resurvey$`sPlot concept unified`)) %>% 
+  dplyr::select(- all_of(contains("_sd"))) %>% 
+  mutate(across(SLA.undef_mean:SpecificRootLength_mean, log))
+
+# remove white spaces in trait names
+names(dat.try) = gsub("_mean", "", names(dat.try))
+
+# decide for traits to keep using principal component analysis
+
+# select traits
+dat.try = dat.try %>%
+  dplyr::select(Taxon_name,
+                PlantHeight.veg, StemDiam, # stature
+                RootingDepth, SpecificRootLength, SpecificRootLength.fine, # roots
+                LeafCN.ratio, LeafP, LDMC, # leaf content
+                LeafArea.leaf.undef, LeafThickness, SLA.undef, # leaf architecture
+                Stem.cond.dens, StemConduitDiameter, # water transport
+                SeedMass) %>% # seed size
+  data.table()
+
+# scale traits for calculation of functional diversity
+dat.try.scaled = dat.try %>%
+   mutate(across(PlantHeight.veg:SeedMass, scale_this)) %>% 
+  data.table()
+
+nrow(dat.try.scaled) # 3,834 taxa with trait data
+
+# load red-list status
+dat.redlist = read_delim("redlist_MOTIVATE_subset.csv", 
+                         delim = "\t") %>% 
+  mutate(Country = ifelse(Country == "Slovakia", "Slovak Republic", Country)) %>% 
+  # restrict to european and national red lists 
+  filter(redlist_source %in% c("rl_europe", "rl_Nasia", "rl_NationalRL")) %>% 
+  # exclude regional redlists, which cannot be assigned accoordingly
+  filter(is.na(region_name)) %>% 
+  distinct() %>% 
+  data.table()
+
+# separate into European and national lists
+# and recode to 1 (threatened) and 0 (not threatened/unknown)
+dat.redlist.europe = dat.redlist %>% 
+  filter(redlist_source == "rl_europe") %>% 
+  dplyr::select(`sPlot concept unified`, Country, Threat) %>% 
+  mutate(Threat = ifelse(Threat %in% c("extinct", "threatened"), "threatened", "not threatened")) %>% 
+  filter(Threat == "threatened") %>% 
+  distinct()
+
+dat.redlist.national = dat.redlist %>% 
+  filter(redlist_source == "rl_NationalRL") %>% 
+  dplyr::select(`sPlot concept unified`, Country, Threat)%>% 
+  mutate(Threat = ifelse(Threat %in% c("extinct", "threatened"), "threatened", "not threatened")) %>% 
+  filter(Threat == "threatened") %>% 
+  distinct()
+
+# load phylogenies
+load("motivate_phylo_v10_2024.RData")
+
+# load niche width estimates
+dat.niche.width = read_delim("niche_width.csv", delim = "\t") %>% 
+  dplyr::select(`sPlot concept unified` = species, niche_width = multi.sim) %>% 
+  mutate(q10 = quantile(niche_width, 0.1), 
+         q90 = quantile(niche_width, 0.9)) %>% 
+  mutate(specialist = "intermediate") %>% 
+  mutate(specialist = ifelse(niche_width <= q10, "specialist", specialist)) %>% 
+  mutate(specialist = ifelse(niche_width >= q90, "generalist", specialist)) %>% 
+  dplyr::select(-q10, - q90)
+
+# load native, neophyte, archeophyte classification
+dat.native = read_xlsx("MOTIVATE_species_for_native_non-native_classification-IA.xlsx") %>% 
+  distinct(`sPlot concept unified`, originEurope) %>% 
+  # correct one taxon
+  filter(!(`sPlot concept unified` == "Amaranthus blitum" &
+             originEurope == "neo"))
+
+# clear memory space
+rm("growth_form"); rm("raw_combined"); rm("gap_combined")
+gc()
+
+# 2. prepare and filter data ---------------------------------------------------
+
+# exclude managed time series
+dat.resurvey = dat.resurvey[`Manipulate (y/n)` == "N"] 
+
+# exclude plots marked with presence/absence data 
+# either sum (cover%) == 0 or headerdata$`Cover abundance scale` == "Presence/Absence"
+dat.resurvey = dat.resurvey %>% 
+  filter(`Cover abundance scale` != "Presence/Absence") %>% 
+  group_by(PlotObservationID) %>% 
+  mutate(cover_sum = sum(`Cover %`)) %>%
+  ungroup() %>% 
+  filter(cover_sum > 0) %>% 
+  dplyr::select(-cover_sum)
+
+# attach unique time series ID
+dat.resurvey = dat.resurvey %>% 
+  unite("time_seriesID", c(`ReSurvey project`, `ReSurvey site`, `ReSurvey plot`), 
+        sep = " - ", remove = F)
+
+# remove PlotObservationIDs for time series with relative plot size changes by a factor of more than 2
+# -> in reference to first survey date
+to.keep = dat.resurvey %>% 
+  distinct(PlotObservationID, time_seriesID, `Year of recording`, `Relevé area (m²)`) %>% 
+  group_by(time_seriesID) %>% 
+  arrange(`Year of recording`) %>% 
+  mutate(plot_size_start = `Relevé area (m²)`[1]) %>% 
+  mutate(plot_size_rel_to_start = `Relevé area (m²)` / plot_size_start)  %>% 
+  ungroup() %>% 
+  filter(plot_size_rel_to_start > 0.5 | plot_size_rel_to_start < 2) %>% 
+  pull(PlotObservationID)
+
+dat.resurvey = dat.resurvey %>% 
+  filter(PlotObservationID %in% to.keep)
+
+# Keep only time series with at least two observation years
+dat.resurvey = dat.resurvey %>% 
+  group_by(time_seriesID) %>% 
+  mutate(n_years = length(unique(`Year of recording`))) %>% 
+  ungroup() %>% 
+  filter(n_years > 1) %>% 
+  dplyr::select(- n_years) # ~ 2 sec
+
+# convert to data.table for speed
+dat.resurvey = dat.resurvey %>% 
+  data.table()
+
+# Aggregate (sum) 'Cover %' values from different layers (for each PlotobservationID)
+dat.resurvey = 
+  dat.resurvey[,.(`Cover %` = combine.cover(`Cover %`)),
+               by = list(time_seriesID, PlotObservationID, `ReSurvey project`, `ReSurvey site`, `ReSurvey plot`, `ReSurvey observation`,
+                         `Date of recording`, `Year of recording` , Longitude, Latitude, Country,
+                         `Expert system`, `Relevé area (m²)`, `Cover abundance scale`,
+                         `sPlot concept unified`)] # ~ 20 sec
+
+# clear memory space
+gc()
+
+# 3. load data for calculation of diversity indices ----------------------------
+
+# load classification of habitat trajectories (stable, succession, disturbance, other)
+trajectories.assigned = read_excel("all_EUNIS_combinations_hand_assigned.xlsx", 
+                                   sheet = 1) %>% 
+  dplyr::select(Trajectory, Expert_System1, Expert_System2)
+
+# as only trajectories from lower to higher alphabetical classes are assigned by hand
+# the other half (from higher to lower alphabetical order) must be added while
+# switching succession and disturbance (i.e.) 1->2 = succession must be 2->1 = disturbance
+
+trajectories.assigned2 = trajectories.assigned %>% 
+  dplyr::select(Trajectory = 1, "Expert_System1" = 3, "Expert_System2" = 2) %>% 
+  mutate(Trajectory = dplyr::recode(Trajectory, 
+                            "succession" = "disturbance", 
+                            "disturbance" = "succession"))
+trajectories.assigned = trajectories.assigned %>% 
+  bind_rows(trajectories.assigned2)
+
+rm(list = "trajectories.assigned2")
+
+#  4. calculate diversity indices -----------------------------------------
+
+# compositional diversity 
+resurvey.compositional.diversity = 
+  dat.resurvey[,.(species_richness = calculate.species.richness(`sPlot concept unified`),
+                  cover_sum = (1 - exp(1)^(sum(log(1-(`Cover %` / 100))))) * 100,
+                  shannon_diversity = calculate.shannon.diversity(`sPlot concept unified`, `Cover %`)),
+               by = PlotObservationID] # 4-6 min
+
+
+# functional diversity
+a = Sys.time()
+resurvey.functional.diversity = dat.resurvey %>% 
+  group_by(PlotObservationID) %>% 
+  do(calculate.functional.diversity(.$`sPlot concept unified`, .$`Cover %`)) %>% 
+  ungroup() # 2-3h
+Sys.time() - a
+
+
+# phylogenetic diversity
+a = Sys.time()
+resurvey.phylogenetic.diversity = dat.resurvey %>% 
+  mutate(`sPlot concept unified` = gsub(" ", "_", `sPlot concept unified`)) %>% 
+  group_by(PlotObservationID) %>% 
+  do(calculate.phylogenetic.diversity(.$`sPlot concept unified`, .$`Cover %`)) %>% 
+  ungroup()
+Sys.time() - a # 30-60 min
+
+
+# red list species (no. and % cover)
+# European or national red lists -> always more severe category
+resurvey.threatened = dat.resurvey %>%  
+  
+  # attache European and National red list data
+  dplyr::select(PlotObservationID, Country, `sPlot concept unified`, `Cover %`) %>% 
+  left_join(dat.redlist.europe %>%  
+              dplyr::select(Country, `sPlot concept unified`, Threat),
+            by = c("Country","sPlot concept unified")) %>%
+  left_join(dat.redlist.national %>%  
+              dplyr::select(Country, `sPlot concept unified`, Threat_rl_NationalRL = Threat),
+            by = c("Country","sPlot concept unified")) %>% 
+  # unify into one threat category (the highest threat level reported)
+  mutate(Threat = ifelse(is.na(Threat), "not threatened", Threat)) %>% 
+  mutate(Threat_rl_NationalRL = ifelse(is.na(Threat_rl_NationalRL), "not threatened", Threat_rl_NationalRL)) %>% 
+  mutate(Threat = ifelse(Threat_rl_NationalRL == "threatened", "threatened", Threat)) %>% 
+  # remove columns
+  dplyr::select(- Country, - Threat_rl_NationalRL) %>%
+  # calculate number of species and proportion of threatened species
+  mutate(cover_threatened = ifelse(Threat == "threatened", `Cover %`, 0)) %>% 
+  group_by(PlotObservationID) %>% 
+  reframe(threatened_nr = length(which(Threat == "threatened")),
+          cover_total = (1 - exp(1)^(sum(log(1-(`Cover %` / 100))))) * 100,
+          cover_threatened = (1 - exp(1)^(sum(log(1-(cover_threatened / 100))))) * 100) %>% 
+  mutate(threatened_cover_percent = cover_threatened / cover_total * 100) %>% 
+  dplyr::select(- cover_total, - cover_threatened)
+
+# non-native species(European level, no. and % of total cover)
+resurvey.native = dat.resurvey %>% 
+ dplyr::select(PlotObservationID, `sPlot concept unified`, `Cover %`) %>% 
+  left_join(dat.native, 
+            by = "sPlot concept unified") %>% 
+  mutate(originEurope = ifelse(originEurope %in% c("arch", "neo"), 
+                               "non-native", "native")) %>% 
+  mutate(cover_non_native = ifelse(originEurope == "non-native", `Cover %`, 0)) %>% 
+  # calculate number and % of total plant cover by of non-native  species
+  group_by(PlotObservationID) %>%
+  reframe(non_native_nr = length(which(originEurope == "non-native")),
+          cover_total = (1 - exp(1)^(sum(log(1-(`Cover %` / 100))))) * 100,
+          cover_non_native = (1 - exp(1)^(sum(log(1-(cover_non_native / 100))))) * 100) %>% 
+  mutate(non_native_cover_percent = cover_non_native / cover_total * 100) %>% 
+  dplyr::select(- cover_total, - cover_non_native)
+
+
+# niche width (CWM, no. and percentage cover of specialist/generalist species)
+resurvey.niche_width = dat.resurvey %>% 
+  dplyr::select(PlotObservationID, `sPlot concept unified`, `Cover %`) %>% 
+  left_join(dat.niche.width, 
+            by = "sPlot concept unified") %>% 
+  mutate(cover_with_niche_width = ifelse(!(is.na(specialist)), `Cover %`, 0),
+         cover_specialist = ifelse(specialist == "specialist", `Cover %`, 0),
+         cover_generalist = ifelse(specialist == "generalist", `Cover %`, 0)) %>% 
+  group_by(PlotObservationID) %>% 
+  reframe(specialist_nr = length(which(specialist == "specialist")),
+          generalist_nr = length(which(specialist == "generalist")),
+          cover_total = (1 - exp(1)^(sum(log(1-(`Cover %` / 100))))) * 100,
+          cover_with_niche_width = (1 - exp(1)^(sum(log(1-(cover_with_niche_width / 100))))) * 100,
+          cover_specialist = (1 - exp(1)^(sum(log(1-(cover_specialist / 100)), na.rm = T))) * 100,
+          cover_generalist = (1 - exp(1)^(sum(log(1-(cover_generalist / 100)), na.rm = T))) * 100,
+          CWM_niche_width =  weighted.mean(niche_width, `Cover %`, na.rm = T)) %>% 
+  mutate(prop_cover_with_niche_width = cover_with_niche_width / cover_total) %>%
+  filter(prop_cover_with_niche_width >= 0.8) %>% 
+  dplyr::select(- cover_total, - cover_with_niche_width, - prop_cover_with_niche_width)
+
+# bind together all plot-level indices
+resurvey.diversity = dat.resurvey %>% 
+  distinct(time_seriesID, PlotObservationID, `ReSurvey project`,
+           `ReSurvey site`, `ReSurvey plot`, `ReSurvey observation`, 
+           `Date of recording`, `Year of recording`, 
+           Longitude, Latitude, Country, `Expert system`, 
+           `Cover abundance scale`, `Relevé area (m²)`) %>% 
+  left_join(resurvey.compositional.diversity, by = "PlotObservationID") %>% 
+  left_join(resurvey.functional.diversity, by = "PlotObservationID") %>% 
+  left_join(resurvey.phylogenetic.diversity, by = "PlotObservationID") %>% 
+  left_join(resurvey.threatened, by = "PlotObservationID") %>%
+  left_join(resurvey.native, by = "PlotObservationID") %>% 
+  left_join(resurvey.niche_width, by = "PlotObservationID")
+
+fwrite(resurvey.diversity, 
+       "plot_level_diversity_CWMs_CWVs.csv",
+       sep = "\t")
+
+# 11. calculate decadal trends in gamma diversity ------------------------------
+
+# decadal trend in gamma diversity 
+# assigned to stable, disturbance, succession, other in EUNIS level 3
+results.all = list()
+to.check = list()
+for(year.temp in seq(from = 1910, to = 2020, by = 10)){
+  results.all[[as.character(year.temp)]] = 
+    get.decadal.changes.in.species.richness.with.hand.assigned.trajectories(
+      dat.resurvey, year.temp, timespan.to.analyse = 10)}
+
+# check results
+for(i in 1:length(results.all)){
+  for(j in 1:length(results.all[[i]])){
+    for(k in 1:length(results.all[[i]][[j]])){
+      if(length(results.all[[i]][[j]][[k]]) > 0){
+        for(l in 1:length(results.all[[i]][[j]][[k]])){
+          if(ncol(results.all[[i]][[j]][[k]][[l]]) < 3){
+            print(results.all[[i]][[j]][[k]][[l]])}}}}}}
+
+# bind rows of nested lists
+for(i in 1:length(results.all)){
+  for(j in 1:length(results.all[[i]])){
+    for(k in 1:length(results.all[[i]][[j]])){
+      results.all[[i]][[j]][[k]] = bind_rows(results.all[[i]][[j]][[k]])}
+    results.all[[i]][[j]] = bind_rows(results.all[[i]][[j]])}
+  results.all[[i]] = bind_rows(results.all[[i]])}
+
+results.decadal.trends.based.on.hand.assigned.trajectories = bind_rows(results.all)
+
+# write results of gamma richness trends
+write_delim(results.decadal.trends.based.on.hand.assigned.trajectories, 
+            "decadal_trends_in_gamma_richness_EUNIS3.csv", 
+            delim = "\t")

@@ -1,0 +1,319 @@
+###############################################################################
+# Analyse diversity changes in ReSurveyEurope time series in percentage changes
+# Script by: Stephan Kambach using code from Helge Bruelheide
+# stephan.kambach@gmail.com, helge.bruelheide@botanik.uni-halle.de
+# initial date: 18.06.2024
+##############################################################################
+
+# clear workspace
+rm(list=ls())
+gc()
+
+# load libraries
+library(tidyverse)
+library(tidymodels)
+library(broom.mixed)
+library(data.table)
+library(lubridate)
+library(lme4)
+library(vegan)
+library(metan)
+library(weights)
+library(ggforce)
+library(modEvA)
+library(readxl)
+library(xlsx)
+library(hier.part)
+library(dominanceanalysis)
+
+# set working directory
+setwd()
+
+# load additional functions
+source("additional functions.R")
+
+# 1. load and prepare data -----------------------------------------------------
+# load all linear trends
+all.lm.tidy.fits = readRDS("all_rate_lm_tidy_fits.RDS") %>% 
+  mutate(metric = recode(metric,
+                         "cover_sum" = "Cover", "species_richness" = "Species\nrichness", "shannon_diversity" = "Shannon\ndiversity",
+                         "FRic" = "Functional\nrichness",  "FEve" = "Functional\nevenness", "FDiv" = "Functional\ndivergence",
+                         "PD" = "Faith\nphylogenetic diversity", "MPD" = "Mean pairwise\nphylogenetic distance", "MNTD" = "Mean nearest\ntaxon distance", 
+                          "threatened_nr" = "No. of\nRed List species", "threatened_cover_percent" = "Cover of\nRed List species", 
+                         "non_native_nr" = "No. of\nnon-native species", "non_native_cover_percent" = "Cover of\nnon-native species",
+                         "specialist_nr" = "No. of\nspecialists", "cover_specialist" = "Cover of\nspecialists",
+                         "generalist_nr" = "No. of\ngeneralists", "cover_generalist" = "Cover of\ngeneralists",
+                         "CWM_niche_width" = "Community-weighted\nmean niche width")) %>% 
+  drop_na(slope)
+
+# load EUNIS habitat names
+EUNIS.names = read_delim("EUNIS-ESy-2025-01-18_legendfromESYfile_adapted.txt",
+                         delim = "\t") %>% 
+  dplyr::select(code, name) %>% 
+  # replace MA in EUNIS classification with M
+  mutate(code = gsub("MA", "M", code))
+
+# load hand-assigned EUNIS trajectories
+EUNIS.trajectories = read_excel("all_EUNIS_combinations_hand_assigned.xlsx", 
+                                sheet = 1) %>% 
+  dplyr::select(Trajectory, Expert_System1, Expert_System2) %>% 
+  # replace MA in EUNIS classification with M
+  mutate(Expert_System1  = gsub("MA", "M", Expert_System1),
+         Expert_System2  = gsub("MA", "M", Expert_System2))
+
+# as only trajectories from lower to higher alphabetical classes are assigned by hand
+# the other half (from higher to lower alphabetical order) must be added while
+# switching succession and disturbance (i.e.) 1->2 = succession must be 2->1 = disturbance
+EUNIS.trajectories = EUNIS.trajectories %>% 
+  bind_rows(EUNIS.trajectories %>% 
+              dplyr::select(Trajectory = 1, "Expert_System1" = 3, "Expert_System2" = 2) %>% 
+              mutate(Trajectory = recode(Trajectory, 
+                                         "succession" = "disturbance", 
+                                         "disturbance" = "succession")))
+
+# all metrics to analyse
+all.metrics = c("cover_sum", "species_richness", "shannon_diversity", 
+                "FRic", "FEve", "FDiv", "PD", "MPD", "MNTD",
+                "threatened_nr", "threatened_cover_percent", 
+                "non_native_nr", "non_native_cover_percent", 
+                "specialist_nr", "generalist_nr", "cover_specialist", "cover_generalist", 
+                "CWM_niche_width")
+
+# rename EUNIS classes
+EUNIS1.rename = c("~" = "- unassigned", 
+                  "M" = "MA - Marine habitats", 
+                  "N" = "N - Coastal habitats",
+                  "P" = "P - Inland waters",
+                  "Q" = "Q - Mires and wetlands",
+                  "R" = "R - Grasslands", 
+                  "S" = "S - Shrublands and heathlands", 
+                  "T" = "T - Forests", 
+                  "U" = "U - Inland sparse vegetation", 
+                  "V" = "V - Vegetated man-made habitats")
+
+EUNIS1.colors = c("all" = "black", 
+                  "- unassigned" = "#D3D3D3",
+                  "MA - Marine habitats" = "#bf93d2",
+                  "N - Coastal habitats" = "#9ecae1",
+                  "P - Inland waters" = "#6083d0",
+                  "Q - Mires and wetlands" = "#addd8e",
+                  "R - Grasslands" = "#f6e95e",
+                  "S - Shrublands and heathlands" = "#fe9929",
+                  "T - Forests" = "#31a354",
+                  "U - Inland sparse vegetation" = "#eaa9a5",
+                  "V - Vegetated man-made habitats" = "#b7251b")
+
+# H1: Is there a general decline in plant diversity -----------------------
+
+# Calculate grand mean effects across all time series
+grand.means.all = all.lm.tidy.fits %>% 
+  dplyr::select(slope, weight_value, metric, EUNIS1_start, timespan) %>% 
+  nest(lm_data = c(slope, weight_value, EUNIS1_start, timespan)) %>% 
+  mutate(lm_fit = purrr::map(lm_data, ~ lm(slope ~ 1,
+                                           weight = weight_value, data = .x))) %>% 
+  mutate(tidy_fit = purrr::map(lm_fit, broom.mixed::tidy, conf.int = T, conf.method = "Wald"), 
+         n = map_dbl(lm_data, nrow), 
+         timespan = map_dbl(lm_data, ~ mean(.x$timespan, na.rm = TRUE))) # 1min
+
+# collect results in tibble
+grand.means.all = grand.means.all$tidy_fit %>%
+  bind_rows() %>% 
+  mutate(metric = grand.means.all$metric, 
+         n =  grand.means.all$n,
+         timespan = grand.means.all$timespan) %>% 
+  mutate(estimate_round = round(estimate, 2),
+         sign = factor(ifelse(between(0, conf.low, conf.high), "non-significant", "significant"))) %>% 
+  mutate(alpha = ifelse(sign == "significant", 1, 0.3),
+         linetype = ifelse(sign == "significant", "solid", "dashed"))
+
+# estimate for CWM niche width need to be more precise
+grand.means.all$estimate_round[grand.means.all$metric == "Community-weighted\nmean niche width"] = 
+  round(grand.means.all$estimate[grand.means.all$metric == "Community-weighted\nmean niche width"], 3)
+
+# check results
+grand.means.all %>% 
+  dplyr::select(metric, estimate_round, conf.low, conf.high, n, timespan)
+
+# H2: Specificity of annual trends among all habitats and trajectories ---------
+
+# number of trajectories
+all.lm.tidy.fits %>% 
+  filter(metric == "Cover") %>% 
+  group_by(Trajectory) %>% 
+  reframe(n = length(time_seriesID)) %>% 
+  mutate(prop = n / sum(n))
+
+# Calculate group-levels means within EUNIS1 habitats and trajectories
+EUNIS1.grand.means = all.lm.tidy.fits %>% 
+  drop_na(slope) %>% 
+  filter(EUNIS1_start != "- unassigned") %>% 
+  dplyr::select(slope, weight_value, metric, EUNIS1_start) %>% 
+  nest(lm_data = c(slope, weight_value)) %>% 
+  mutate(lm_fit = map(lm_data, ~ lm(slope ~ 1, 
+                                    weight = weight_value, data = .x)),
+         tidy_fit = map(lm_fit, broom.mixed::tidy, conf.int = T, conf.method = "Wald"),
+         n = map_dbl(lm_data, nrow)) # 1 min
+
+EUNIS1.means.per.trajectory = all.lm.tidy.fits %>% 
+  drop_na(slope) %>% 
+  filter(EUNIS1_start != "- unassigned") %>% 
+  dplyr::select(slope, weight_value, metric, EUNIS1_start, Trajectory) %>% 
+  nest(lm_data = c(slope, weight_value)) %>% 
+  mutate(lm_fit = map(lm_data, ~ lm(slope ~ 1, 
+                                    weight = weight_value, data = .x)),
+         tidy_fit = map(lm_fit, broom.mixed::tidy, conf.int = T, conf.method = "Wald"),
+         n = map_dbl(lm_data, nrow)) # 1 min
+
+# collect results
+EUNIS1.grand.means = EUNIS1.grand.means$tidy_fit %>%
+  bind_rows() %>% 
+  mutate(metric = EUNIS1.grand.means$metric,
+         EUNIS1_start = EUNIS1.grand.means$EUNIS1_start,
+         n = EUNIS1.grand.means$n)
+
+EUNIS1.means.per.trajectory = EUNIS1.means.per.trajectory$tidy_fit %>%
+  bind_rows() %>% 
+  mutate(metric = EUNIS1.means.per.trajectory$metric,
+         EUNIS1_start = EUNIS1.means.per.trajectory$EUNIS1_start, 
+         Trajectory = EUNIS1.means.per.trajectory$Trajectory,
+         n = EUNIS1.means.per.trajectory$n)
+
+# at least 10 time series for results
+EUNIS1.grand.means = EUNIS1.grand.means %>% 
+  filter(n >= 10)
+
+EUNIS1.means.per.trajectory = EUNIS1.means.per.trajectory %>% 
+  filter(n >= 10)
+
+# H3: Partitioning of explained variation --------------------------------------
+
+# filter data
+data.for.varpart = all.lm.tidy.fits %>% 
+  # EUNIS3 must be available
+  filter(EUNIS3_start != "- unassigned") %>% 
+  # Trajectory must be clear
+  filter(Trajectory %in% c("stable", "succession", "disturbance")) %>% 
+  
+  # at least 10 time_seriesID covering at least 2 different years_ed per UNIS3_start and Trajectory
+  group_by(metric, EUNIS3_start, Trajectory) %>% 
+  mutate(n_time_seriesID = length(time_seriesID),
+         n_years = length(unique(year_end))) %>% 
+  ungroup() %>% 
+  filter(n_time_seriesID >= 10 &
+           n_years >= 2) %>% 
+  
+  # at least 2 different trajectories per EUNIS3 habitat type
+  group_by(metric, EUNIS3_start) %>% 
+  mutate(n_trajectories = length(unique(Trajectory))) %>% 
+  ungroup() %>% 
+  filter(n_trajectories >= 2) %>% 
+  
+  # at least two EUNIS3_start per EUNIS1_start
+  group_by(metric, EUNIS1_start) %>% 
+  mutate(n_EUNIS3 = length(unique(EUNIS3_start))) %>% 
+  ungroup() %>% 
+  filter(n_EUNIS3 >= 2)
+
+# check 
+table(data.for.varpart$EUNIS3_start) # enough for N,Q, R, S, T, U, V
+table(substr(names(table(data.for.varpart$EUNIS3_start)), 1, 1)) # enough for N,Q, R, S, T, U, V
+data.for.varpart %>%  filter(metric == "Cover") %>% nrow() # 15,348
+
+# do variance partitioning within each EUNIS1 habitat type
+results.temp = list()
+
+for(metric.temp in unique(data.for.varpart$metric)){
+ 
+  results.temp[[metric.temp]] = list()
+  
+  dat.temp = data.for.varpart %>%  
+    filter(metric == metric.temp)  
+  
+  for(EUNIS1.temp in unique(dat.temp$EUNIS1_start)){
+    
+    dat.temp.temp = dat.temp %>% 
+      filter(EUNIS1_start == EUNIS1.temp)
+    
+    #table(dat.temp.temp$year_end, dat.temp.temp$EUNIS3_start, dat.temp.temp$Trajectory)
+    
+    # use hierarchical partitioning from Chevan and Sutherland (1991)
+    dat.temp.temp = dat.temp.temp %>% 
+      mutate(combined = interaction(EUNIS3_start,
+                                    Trajectory)) 
+    
+    full_model = lm(slope ~ EUNIS3_start + Trajectory + year_end + combined,
+                    data = dat.temp.temp)
+    
+    # dominance analysis -> partitions predictor contributions to unadjusted R²
+    dominance.temp = dominanceAnalysis(full_model)
+    
+    results.temp[[metric.temp]][[EUNIS1.temp]] = 
+      tibble(metric = metric.temp,
+             EUNIS1_start = EUNIS1.temp,
+             EUNIS3_start = dominance.temp$contribution.average$r2["EUNIS3_start"],
+             Trajectory = dominance.temp$contribution.average$r2["Trajectory"],
+             combined = dominance.temp$contribution.average$r2["combined"],
+             year_end = dominance.temp$contribution.average$r2["year_end"],
+             unexplained = 1 - sum(dominance.temp$contribution.average$r2),
+             p_value = summary(full_model)$fstatistic %>% {unname(pf(.[1],.[2],.[3],lower.tail=F))}) %>% 
+      mutate(model_sign = ifelse(p_value < 0.05, "significant", "non-significant"), 
+             sign_sign = ifelse(p_value < 0.05, "*", " "))
+  }
+  print(paste0("done: ", metric.temp))
+}
+
+# flatten nested list
+for(i in 1:length(results.temp)){
+  results.temp[[i]] = bind_rows(results.temp[[i]])}
+results.temp = bind_rows(results.temp)
+
+
+# HX: Sensitivity: General trends averaged across all habitat types ------------
+
+# assign weights to each time series for equal weight of each EUNIS3_start
+grand.means.all = all.lm.tidy.fits %>%
+  drop_na(slope) %>% 
+  # only time series with EUNIS level 3 habitat types
+  filter(EUNIS3_start != "- unassigned") %>% 
+  # weight so that each combination of metric * EUNIS3_start has the same weight
+  group_by(metric, EUNIS3_start) %>%
+  mutate(n_per_EUNIS3 = length(time_seriesID)) %>%
+  ungroup() %>%
+  # at least ten time series per EUNIS3 habitat
+  filter(n_per_EUNIS3 >= 10) %>% 
+  # calculate weight of time series
+  mutate(weight_n_EUNIS3 = 1/n_per_EUNIS3) %>% 
+  # calculate number of EUNIS3 classes per metric
+  group_by(metric) %>% 
+  mutate(n_EUNIS3_classes = length(unique(EUNIS3_start))) %>% 
+  ungroup()
+
+# check
+grand.means.all %>% 
+  distinct(EUNIS3_start, Trajectory) %>% 
+  group_by(Trajectory) %>% 
+  reframe(n = length(EUNIS3_start))
+
+# calculate grand means with linear models
+grand.means.all = grand.means.all %>% 
+  dplyr::select(slope, metric, EUNIS3_start, weight_n_EUNIS3, n_EUNIS3_classes) %>%
+  nest(lm_data = c(slope, EUNIS3_start, weight_n_EUNIS3)) %>%
+  mutate(lm_fit = purrr::map(lm_data, ~ lm(slope ~ 1,
+                                           weight = weight_n_EUNIS3, data = .x))) %>%
+  mutate(tidy_fit = purrr::map(lm_fit, broom.mixed::tidy, conf.int = T, conf.method = "Wald"))
+
+# collect results in tibble -> in %
+grand.means.all = grand.means.all$tidy_fit %>%
+  bind_rows() %>% 
+  mutate(metric = grand.means.all$metric, 
+         n_EUNIS3_classes = grand.means.all$n_EUNIS3_classes) %>% 
+  dplyr::select(metric, n_EUNIS3_classes, estimate, conf.low, conf.high) %>% 
+  mutate(estimate_round = round(estimate, 3),
+         conf.low = round(conf.low, 3), 
+         conf.high = round(conf.high, 3),
+         sign = factor(ifelse(between(0, conf.low, conf.high), "non-significant", "significant"))) %>% 
+  mutate(alpha = ifelse(sign == "significant", 1, 0.3),
+         linetype = ifelse(sign == "significant", "solid", "dashed"),)
+
+# check results
+grand.means.all
